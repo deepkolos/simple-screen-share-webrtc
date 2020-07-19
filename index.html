@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>screen share</title>
+    <style>
+      #room {
+        display: none;
+      }
+
+      #user-list {
+        flex: auto;
+      }
+
+      #stream-list {
+        display: flex;
+        flex-wrap: wrap;
+      }
+
+      .item-user {
+        display: inline-block;
+        padding: 5px;
+        background: turquoise;
+        margin: 5px;
+      }
+
+      .nav-bar {
+        display: flex;
+      }
+
+      .item-stream {
+        flex: 1;
+        border: 1px solid black;
+        margin: 5px;
+      }
+      .item-stream-title {
+        background-color: cadetblue;
+        color: white;
+      }
+      .item-stream-video {
+        width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="register">
+      名称: <input id="input-name" /> <button id="btn-enter">进入</button>
+    </div>
+
+    <div id="room">
+      <div class="nav-bar">
+        <div id="user-list"></div>
+        <button id="btn-share-screen">共享屏幕</button>
+      </div>
+
+      <div id="stream-list"></div>
+    </div>
+    <script>
+      // class
+      const env = {
+        sock: 'ws://127.0.0.1:8081', //
+        iceServers: [
+          'stun:stun.schlund.de:3478',
+          'stun:stun.voiparound.com:3478',
+          'stun:stun.voipbuster.com:3478',
+          'stun:stun.ideasip.com:3478',
+        ],
+      };
+
+      class Sock {
+        constructor(url) {
+          this.opened = false;
+          this.broadcastListeners = new Set();
+          this.openPromise = new Promise((resolve, reject) => {
+            try {
+              this.conn = new WebSocket(url);
+              this.conn.onopen = () => {
+                this.opened = true;
+                resolve();
+              };
+              this.conn.onmessage = e => {
+                const res = JSON.parse(e.data);
+                if (!res._t) this.broadcastListeners.forEach(cb => cb(res));
+              };
+            } catch (error) {
+              reject(error);
+            }
+          });
+        }
+
+        request(msg) {
+          if (!this.opened) return;
+          return new Promise((resolve, reject) => {
+            msg._t = performance.now() + Math.random().toFixed(2);
+            const onMsg = e => {
+              const res = JSON.parse(e.data); // TODO: 解决多次解码的问题
+              if (res._t === msg._t) {
+                this.conn.removeEventListener('message', onMsg);
+                resolve(res);
+              }
+            };
+            setTimeout(() => reject(new Error('timeout')), 3000);
+            this.conn.addEventListener('message', onMsg);
+            this.conn.send(JSON.stringify(msg));
+          });
+        }
+
+        onBroadcast(cb) {
+          this.broadcastListeners.add(cb);
+          // disposable
+          return () => this.broadcastListeners.delete(cb);
+        }
+
+        destory() {
+          if (!this.opened) return;
+          this.conn.onopen = null;
+          this.conn.close();
+          this.broadcastListeners.length = 0;
+        }
+      }
+
+      class P2P {
+        constructor(iceServers) {
+          this.conn = new RTCPeerConnection({
+            iceServers: [{ urls: iceServers }],
+          });
+          this.onTrack = () => {};
+          this.onCandidate = () => {};
+          this.conn.addEventListener('track', e => this.onTrack(e));
+          this.conn.addEventListener('icecandidate', e => {
+            if (e.candidate) this.onCandidate(e.candidate);
+          });
+        }
+
+        async offer(video = 1, audio = 0) {
+          const offer = await this.conn.createOffer({
+            offerToReceiveAudio: audio,
+            offerToReceiveVideo: video,
+          });
+          this.conn.setLocalDescription(offer);
+          return offer;
+        }
+
+        async answer(offer, video = 1, audio = 0) {
+          await this.conn.setRemoteDescription(offer);
+          const answer = await this.conn.createAnswer({
+            offerToReceiveAudio: audio,
+            offerToReceiveVideo: video,
+          });
+          await this.conn.setLocalDescription(answer);
+          return answer;
+        }
+
+        setRemoteDescription(answer) {
+          return this.conn.setRemoteDescription(answer);
+        }
+
+        addIceCandidate(candidate) {
+          return this.conn.addIceCandidate(candidate);
+        }
+
+        addStream(stream) {
+          // this.removeALLStream();
+          stream &&
+            stream
+              .getTracks()
+              .forEach(track => this.conn.addTrack(track, stream));
+        }
+
+        removeALLStream() {
+          this.conn
+            .getSenders()
+            .forEach(sender => this.conn.removeTrack(sender));
+        }
+
+        destory() {
+          this.conn.close();
+          this.onCandidate = null;
+        }
+      }
+
+      class User {
+        constructor(name = 'anonymous') {
+          this.id = null;
+          this.role = null;
+          this.stream = null;
+          this.name = name;
+          this.p2pMap = new Map();
+          this.streamMap = new Map();
+          this.onUpdate = () => {};
+          this.dispose = sock.onBroadcast(this.handleBroadcast.bind(this));
+
+          sock.openPromise
+            .then(() => sock.request({ type: 'register', name }))
+            .then(({ id, users }) => {
+              this.online = true;
+              this.id = id;
+              this.onUpdate({ type: 'register', users });
+            })
+            .catch(e => {
+              console.log('TCL: User -> this.onUpdate -> e', e);
+            });
+        }
+
+        createOffer(userId) {
+          const p2p = new P2P(env.iceServers);
+          p2p.addStream(this.stream);
+          p2p.onCandidate = candidate => {
+            sock.request({
+              type: 'candidate',
+              fromId: this.id,
+              toId: userId,
+              candidate,
+            });
+          };
+          p2p.onTrack = e => {
+            this.streamMap.set(userId, e.streams);
+            this.onUpdate();
+          };
+          this.p2pMap.set(userId, p2p);
+          return p2p.offer();
+        }
+
+        createAnswer(userId, offer) {
+          const p2p = new P2P(env.iceServers);
+          p2p.addStream(this.stream);
+          p2p.onCandidate = candidate => {
+            sock.request({
+              type: 'candidate',
+              fromId: this.id,
+              toId: userId,
+              candidate,
+            });
+          };
+          p2p.onTrack = e => {
+            this.streamMap.set(userId, e.streams);
+            this.onUpdate();
+          };
+          this.p2pMap.set(userId, p2p);
+          return p2p.answer(offer);
+        }
+
+        async handleBroadcast(res) {
+          if (res.type === 'online' && res.user.id !== this.id && this.stream) {
+            console.log('send offer to', res.user.id);
+            const offer = await this.createOffer(res.user.id);
+            sock.request({
+              type: 'offer',
+              fromId: this.id,
+              toId: res.user.id,
+              offer,
+            });
+          }
+          if (res.type === 'offline' && res.id !== this.id) {
+            const p2p = this.p2pMap.get(res.id);
+            if (p2p) {
+              p2p.destory();
+              this.p2pMap.delete(res.id);
+              this.streamMap.delete(res.id);
+              this.onUpdate();
+            }
+          } else if (res.toId === this.id) {
+            if (res.type === 'offer') {
+              console.log('send answer to', res.fromId);
+              const answer = await this.createAnswer(res.fromId, res.offer);
+              sock.request({
+                type: 'answer',
+                fromId: this.id,
+                toId: res.fromId,
+                answer,
+              });
+            } else if (res.type === 'answer') {
+              console.log('receive answer from', res.fromId);
+              const p2p = this.p2pMap.get(res.fromId);
+              p2p && p2p.setRemoteDescription(res.answer);
+            } else if (res.type === 'candidate') {
+              console.log('receive candidate from', res.fromId);
+              const p2p = this.p2pMap.get(res.fromId);
+              p2p && p2p.addIceCandidate(res.candidate);
+            }
+          }
+        }
+
+        setName(name) {
+          return sock.openPromise
+            .then(() => sock.request({ type: 'update', id: this.id, name }))
+            .then(res => {
+              if (res.code === 200) {
+                this.name = name;
+                this.onUpdate();
+              } else {
+                console.error('fail update name');
+              }
+            });
+        }
+
+        async shareMediaSteam(stream, userId) {
+          this.stream = stream;
+          this.streamMap.set(this.id, [stream]);
+          this.onUpdate();
+          if (userId === this.id) return;
+
+          console.log('send offer to', userId);
+          const offer = await this.createOffer(userId);
+          sock.request({
+            type: 'offer',
+            fromId: this.id,
+            toId: userId,
+            offer,
+          });
+        }
+
+        destory() {
+          sock.request({
+            type: 'unregister',
+            id: this.id,
+          });
+          this.dispose();
+          sock.destory();
+          this.p2pMap.forEach(p2p => p2p.destory());
+          this.p2pMap.clear();
+        }
+      }
+
+      class UserList {
+        constructor() {
+          this.users = new Map();
+          this.onUpdate = () => {};
+          this.dispose = sock.onBroadcast(res => {
+            switch (res.type) {
+              case 'online':
+                this.users.set(res.user.id, res.user);
+                break;
+              case 'offline':
+                this.users.delete(res.id);
+                break;
+              case 'update': {
+                const user = this.users.get(res.user.id);
+                if (user) {
+                  user.name = res.user.name;
+                }
+                break;
+              }
+            }
+            this.onUpdate(res);
+          });
+        }
+
+        set(users) {
+          users.forEach(user => {
+            if (!this.users.has(user.id)) this.users.set(user.id, user);
+          });
+        }
+
+        destory() {
+          this.dispose();
+        }
+      }
+
+      // model
+      const sock = new Sock(env.sock);
+      const user = new User();
+      const userList = new UserList();
+
+      // event
+      on($('btn-share-screen'), 'click', async () => {
+        const stream = await getScreenStream();
+        userList.users.forEach(({ id }) => {
+          user.shareMediaSteam(stream, id);
+        });
+        $('btn-share-screen').setAttribute('disabled', true);
+        $('btn-share-screen').innerText = '已共享';
+      });
+      on($('btn-enter'), 'click', async () => {
+        if (user) {
+          await user.setName($('input-name').value);
+          $('register').style.display = 'none';
+          $('room').style.display = 'block';
+        }
+      });
+      on(window, 'beforeunload', () => {
+        user.destory();
+        userList.destory();
+      });
+      userList.onUpdate = res => {
+        // view
+        $('user-list').innerHTML = '';
+        const frag = document.createDocumentFragment();
+        userList.users.forEach(({ id, name }) => {
+          frag.appendChild(
+            div('item-user', `${name}${user.id === id ? '[我]' : ''}`),
+          );
+        });
+        $('user-list').appendChild(frag);
+      };
+      user.onUpdate = e => {
+        if (e && e.type === 'register' && e.users) {
+          userList.set(e.users);
+        }
+
+        $('stream-list').innerHTML = '';
+        const frag = document.createDocumentFragment();
+        user.streamMap.forEach((streams, userId) => {
+          // console.log('TCL: streams', streams);
+          // console.log('TCL: userId', userId);
+          const user = userList.users.get(userId) || { name: 'unknow' };
+          const $item = div('item-stream');
+          const $title = div('item-stream-title', user.name);
+          const $video = document.createElement('video');
+          $video.className = 'item-stream-video';
+          $video.muted = true;
+          $video.autoplay = true;
+          $video.srcObject = streams[0];
+          $item.appendChild($title);
+          $item.appendChild($video);
+          frag.appendChild($item);
+        });
+        $('stream-list').appendChild(frag);
+      };
+
+      // utils
+      function $(id) {
+        return document.getElementById(id);
+      }
+      function on(el, evt, cb) {
+        return el.addEventListener(evt, cb);
+      }
+      function div(className, innerText = '') {
+        const $div = document.createElement('div');
+        $div.className = className;
+        $div.innerText = innerText;
+        return $div;
+      }
+      function getScreenStream() {
+        return window.navigator.mediaDevices.getUserMedia({
+          video: {
+            mediaSource: 'window',
+          },
+        });
+      }
+    </script>
+  </body>
+</html>
